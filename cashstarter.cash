@@ -1,0 +1,122 @@
+pragma cashscript ^0.8.0;
+
+//////////////////
+// Flipstarter-like fundraising campaign on CashTokens.
+//      deadline: last blockheight funds are allowed to be pledged to the campaign
+//      fundTarget: how much BCH is being raised in satoshis
+//      creatorAddress: the campaign creators address where funds will be sent if successful
+//
+//  Funders pledge funds to the campaign using 'addFunds'. They receive a receipt NFT recording the amount they pledged.
+//  If the campaign succeeds the creator can call 'claimFunds' to send all raised funds to their address
+//  If the campaign fails pledgers can call 'reclaimFunds' to refund their pledge. This burns their receipt NFT.
+//
+//  The contracts minting NFT has its nftCommitment set to the total BCH added to the campaign which is used as
+//  a historical record of funds pledged, and in combination with fundTarget, whether the campaign succeeded or not.
+//////////////////
+
+contract CashStarter(int deadline, int fundTarget, pubkey creatorPK) {
+    function addFunds(
+    ) {
+        require(tx.time >= deadline);                          // Require campaign is still active
+        require(tx.inputs[0].nftCommitment < fundTarget);      // Require campaign is not already fully funded
+
+        // Require the covenant contract always lives at index zero... is this required because the original utxo is 'consumed' so must be rebuilt with each tx?
+        require(this.activeInputIndex == 0);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);         //...and with a minting NFT
+        require(tx.outputs[0].nftCommitment == tx.outputs[0].value);                //...and an (updated) nftCommitment tracking the total BCH funded to the campaign
+
+        // Determine amount user is adding with this transaction
+        int amountSatsAdded = tx.outputs[0].value - tx.inputs[0].value;
+
+        // Place a minimum on the amount of funds that can be added
+        // Implicitly requires tx.outputs[0].value > tx.inputs[0].value
+        require(amountSatsAdded > 10000);   //???? size minimum to prevent spam/ddos?
+
+//???? What's the reason for bytes8, just max expected size of satoshis?
+//???? Assume fundsAdded needs to be 'bytes' because nftCommitment field requires it?
+        bytes fundsAdded = bytes8(amountSatsAdded);
+
+        // Require there to be at most three outputs so no additional NFTs can be minted
+        require(tx.outputs.length <= 3);
+
+        // 2nd output contains NFT receipt for the funds added to the pool
+        // Get the tokenCategory of the minting NFT without the minting capability added
+        bytes tokenCategoryReceipt = tx.inputs[0].tokenCategory.split(32)[0];
+        require(tx.outputs[1].tokenCategory == tokenCategoryReceipt);
+
+        // The receipt NFT is sent back to the same address of the first user's input
+        // The NFT commitment of the receipt contains what the user added to the campaign
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);
+        require(tx.outputs[1].nftCommitment == fundsAdded);
+
+        // A 3rd output for change is allowed
+        if (tx.outputs.length == 3) {
+            // Require that the change output does not mint any NFTs
+            require(tx.outputs[2].tokenCategory == bytes(0));       //// Set output2's tokenCategory to 0, flagging it as not an NFT
+        }
+    }
+    function claimFunds() {
+        // Only claimable when the campaign funding target is met or exceeded
+        require(tx.inputs[0].nftCommitment >= fundTarget); 
+
+        // Require the covenant contract always lives at index zero... is this required because the original utxo is 'consumed' so must be rebuilt with each tx?
+        require(this.activeInputIndex == 0);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);         //...and with a minting NFT
+        require(tx.outputs[0].nftCommitment == tx.inputs[0].nftCommitment);         //...and an nftCommitment tracking the total BCH funded to the campaign
+        
+        //???????????? Not sure after this point. Should return all contract funds (all utxos?) to the creatorAddress contract was created with
+        // Shouldn't need to be locked down since target address is pre-determined and claim can only be called if campaign has passed, so anyone could call it
+
+        // Check that the correct amount is sent
+        int minerFee = 1000; // hardcoded fee
+        int amount = tx.inputs[this.activeInputIndex].value - minerFee;     //???? does each addFunds create a new utxo on this contract address? if so how do you send all utxo's on the address, if possible?
+                                                                            //???? Under the assumption a contract isn't aware of its 'total' hence the nftCommitment workaround in this
+        require(tx.outputs[1].lockingBytecode == tx.inputs[0].lockingBytecode); // Set output1 to ???
+        require(tx.outputs[0].value == amount); // set output0 to the calculated amount
+
+        
+    }
+
+    function reclaimFunds() {
+        // Require campaign is not fully funded.
+        require(tx.inputs[0].nftCommitment < fundTarget);       // Uses minting NFT nftCommitment value since no funds may exist on the contract after successful funding
+
+        // Require the covenant contract always lives at index zero with a minting NFT
+        require(this.activeInputIndex == 0);
+        require(tx.outputs[0].lockingBytecode == tx.inputs[0].lockingBytecode);
+        require(tx.outputs[0].tokenCategory == tx.inputs[0].tokenCategory);
+        require(tx.outputs[0].nftCommitment == tx.inputs[0].nftCommitment);        ////???? - will not assigning the nftCommitment in the output wipe out the existing value? or can it be left alone?
+                                                                                    ////i.e. are the contract inputs where the contract data exists and are 'destroyed' if not also explicitly carried
+                                                                                    ////forward to the output UTXO?
+
+        // Accept NFT of the correct category as input index1
+        // Validate by checking the tokenCategory without capability
+        //// My interperation: Verify the NFT user provided is one of this contracts receipt NFT's, does not check NFT capabilities, only category.
+        bytes tokenCategoryReceipt = tx.inputs[0].tokenCategory.split(32)[0];
+        require(tx.inputs[1].tokenCategory == tokenCategoryReceipt);
+
+        // Read the amount that was pledged to the campaign from the receipt NFT commitment
+        bytes refundAmount = tx.inputs[1].nftCommitment;        // Retrieve commitment data
+        int amountToWithdraw = int(refundAmount);               // Convert data from bytes to int
+
+        // If remaining contract balance is less than amount to refund then set refund to remaining balance
+        if (amountToWithdraw > tx.outputs[0].value) {
+            amountToWithdraw = tx.outputs[0].value; 
+        }
+
+        // Refund the pledged BCH from the contract
+        require(tx.outputs[0].value == tx.inputs[0].value - amountToWithdraw);      //// Set output0 (contract balance), reduces amount of BCH it holds
+
+        // Require there are exactly two outputs so no additional NFTs can be minted
+        require(tx.outputs.length == 2);
+
+        // Require the amount to withdraw (minus fee) is sent to the address that input1 (receipt NFT) came from (the users address)
+        require(tx.outputs[1].lockingBytecode == tx.inputs[1].lockingBytecode);     // Set output1 destination to input1's origination (refunders address)
+        require(tx.outputs[1].value == amountToWithdraw - 1000);                    // Set output1 value to the determined refund amount, minus static miner fee
+
+        // require that the receipt NFT is burned
+        require(tx.outputs[1].tokenCategory == bytes(0));                           //// Set output1's tokenCategory to 0, flagging it as not an NFT
+    }
+}
