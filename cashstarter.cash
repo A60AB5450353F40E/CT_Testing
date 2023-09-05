@@ -14,7 +14,8 @@ pragma cashscript ^0.8.0;
 //  a historical record of funds pledged, and in combination with fundTarget, whether the campaign succeeded or not.
 //////////////////
 
-contract CashStarter(int deadline, int fundTarget, pubkey creatorPK) {
+//# see below, it's easier to just specify owner's receiving address
+contract CashStarter(int deadline, int fundTarget, bytes creatorLockingBytecode, bytes reclaimLockingBytecode) {
     function addFunds(
     ) {
 //# timelock was useless here and >= would have disallowed using this path until AFTER timelock expires
@@ -86,15 +87,27 @@ contract CashStarter(int deadline, int fundTarget, pubkey creatorPK) {
 //# else you'll have undefined behavior e.g. imagine 2 utxos of this contract getting spent together - what would be possible to do with the TX?
 
         // Shouldn't need to be locked down since target address is pre-determined and claim can only be called if campaign has passed, so anyone could call it
+//# yeah but you gotta lock it down so minting NFT can't "escape" the covenant
 
         // Check that the correct amount is sent
         int minerFee = 1000; // hardcoded fee
         int amount = tx.inputs[this.activeInputIndex].value - minerFee;     //???? does each addFunds create a new utxo on this contract address? if so how do you send all utxo's on the address, if possible?
                                                                             //???? Under the assumption a contract isn't aware of its 'total' hence the nftCommitment workaround in this
-        require(tx.outputs[1].lockingBytecode == tx.inputs[0].lockingBytecode); // Set output1 to ???
-        require(tx.outputs[0].value == amount); // set output0 to the calculated amount
 
-        
+//# each addFunds destroys the UTXO being spent by the input and creates an updated one as the output, your "addFunds" ensures that the NFT can't be split to 2 threads to create
+//# more UTXOs.
+//# you could create more utxos at genesis in which case each covenant instance would be an independent chanin of TX-es.
+//# this design, howeve, looks like single-UTXO model, you keep the entire state in that 1 minting NFT, so make sure to initialize Genesis TX correctly: only 1 minting NFT with the contract.
+//# also lock down the inputs, so no funny business:
+        require(tx.inputs.length == 1);
+
+//# Pay out to campaign creator:
+        require(tx.outputs[1].lockingBytecode == creatorLockingBytecode);
+//# you have to check the amount else a miner could steal it for himself - there's always the 1 "invisible output" that is the fee
+        require(tx.outputs[1].value == amount;
+
+//# also lock down the outputs, so no funny business (like someone grieving the TX by adding more 0-value OP_RETURNs):
+        require(tx.inputs.outputs == 2);
     }
 
     function reclaimFunds() {
@@ -136,5 +149,21 @@ contract CashStarter(int deadline, int fundTarget, pubkey creatorPK) {
 
         // require that the receipt NFT is burned
         require(tx.outputs[1].tokenCategory == bytes(0));                           //// Set output1's tokenCategory to 0, flagging it as not an NFT
+    }
+    function forwardToReclaim() {
+//# this is how you make it expire after deadline, you must mutate the contract to some other contract with addFunds and claimFunds functions removed
+//# because users can always set the tx.time to whatever value < current median time past and access the other paths.
+//# the time/height opcodes are the "invalid before time T1" but once T1 has passed then it's valid forever and it doesn't invalidate other paths
+//# BitcoinCash does NOT have an option to encode "invalid after time T2"; the way to do it is to use a path
+//# that's "valid after time T2" but one such that moves money to a new contract where paths you want closed off will be removed
+//# and someone^tm must monitor and execute the path as soon as available
+        require(tx.time >= deadline);
+        require(tx.outputs[this.activeInputIndex].value == tx.inputs[this.activeInputIndex].value);
+        require(tx.outputs[this.activeInputIndex].lockingBytecode == reclaimLockingBytecode);
+        require(tx.outputs[this.activeInputIndex].tokenCategory == tx.inputs[this.activeInputIndex].tokenCategory);
+        require(tx.outputs[this.activeInputIndex].nftCommitment == tx.inputs[this.activeInputIndex].nftCommitment);
+
+//# notice we don't lock down inputs & outputs, we just require the funds to be passed on exact, but to another contract
+//# this means you gotta fund the TX with some BCH and add a change output
     }
 }
